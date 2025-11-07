@@ -1,2 +1,2 @@
 # CLP-ZNE
-Efficient quantum error mitigation technique based on the paper https://arxiv.org/abs/2511.02901.
+Numerical simulations for Cyclic Layout Permutation based Zero Noise Extrapolation protocol for the paper https://arxiv.org/abs/2511.02901.
