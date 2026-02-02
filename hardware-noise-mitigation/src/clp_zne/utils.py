@@ -384,3 +384,17 @@ def estimate_observable_from_counts(H: SparsePauliOp, counts_z: dict, counts_x: 
         "expval_Hx": mean_x,
         "stderr_Hx": stderr_x,
     }
+
+def get_grid_entanglement(rows, cols):
+    """Generates [control, target] pairs for an N x M grid."""
+    links = []
+    for i in range(rows):
+        for j in range(cols):
+            curr = i * cols + j
+            # Horizontal link (Right)
+            if j + 1 < cols:
+                links.append([curr, curr + 1])
+            # Vertical link (Down)
+            if i + 1 < rows:
+                links.append([curr, curr + cols])
+    return links
