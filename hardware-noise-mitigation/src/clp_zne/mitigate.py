@@ -4,7 +4,8 @@ from qiskit_aer import AerSimulator
 from qiskit.quantum_info import DensityMatrix
 from qiskit_aer.noise import depolarizing_error, thermal_relaxation_error
 from qiskit.quantum_info import average_gate_fidelity, SuperOp, Operator
-from .utils import build_subset_circuit, transpile_to_layouts, cyclic_permutations
+from .utils import build_subset_circuit, transpile_to_layouts, cyclic_permutations, linear_extrapolation
+import warnings
 from tqdm import tqdm
 import numpy as np
 
@@ -282,3 +283,98 @@ def CLP_ZNE_mitigate(abstract_cirquit, observables, layouts, backend, noise_mode
         error_sums.append(X)
 
     return evals_mitigated, evals_noisy, error_sums
+
+def ZNE_mitigate(circuit, observables, layout, backend, noise_model, folding_method='gate'):
+    """
+    Implements Digital Zero-Noise Extrapolation.
+    
+    :param circuit: quantum circuit.
+    :param observables: list of observables.
+    :param layout: qubit layout.
+    :param backend: backend to run the circuit on.
+    :param noise_model: noise model used in simulation.
+    :param folding_method: method to use for noise amplification. Possible values are 'gate' and 'circuit' to perform unitary gate folding and unitary circuit folding respectivly. By default is 'gate'.
+    """
+    n_qubits = circuit.num_qubits
+    target = backend.target
+
+    transpiled_circuit = transpile_to_layouts(circuit, [layout], target, add_measurements=False, dynamical_decoupling=False)[0]
+    scaled_circuits = []
+    scale_factors = [1, 3, 5, 7]
+
+    for scale_factor in scale_factors:
+        scaled_circuits.append(fold_circuit(transpiled_circuit, scale_factor, folding_method=folding_method))
+
+    # Run with noise
+    print("Running density matrix simulations")
+    evals_noisy = compute_evals(scaled_circuits, layouts=np.array([layout]*len(scaled_circuits))[:, :n_qubits],
+                                    observables=observables, noise_model=noise_model)
+    
+    # Iterate over observables
+    evals_mitigated = []
+    for noisy_values in evals_noisy:
+        eval_mitigated = linear_extrapolation(x=scale_factors, y=noisy_values)
+        evals_mitigated.append(eval_mitigated)
+
+    return evals_mitigated, evals_noisy
+
+def fold_circuit(circuit: QuantumCircuit, scale_factor: float, folding_method='gate') -> QuantumCircuit:
+        """
+        Fold a quantum circuit to amplify noise. Removes all end circuit measurments.
+        
+        Args:
+            circuit: Original quantum circuit
+            scale_factor: Noise amplification factor (must be odd: 1, 3, 5, ...)
+            folding_method: method to use for noise amplification. Possible values are 'gate' and 'circuit' to perform unitary gate folding and unitary circuit folding respectivly. By default is 'gate'.
+            
+        Returns:
+            Folded quantum circuit
+        """
+        if scale_factor < 1 or int(scale_factor) % 2 == 0:
+            warnings.warn(f"Scale factor {scale_factor} adjusted to nearest odd integer ≥ 1")
+            scale_factor = max(1, 2 * int(np.ceil((scale_factor - 1) / 2)) + 1)
+        
+        scale_int = int(scale_factor)
+        
+        if scale_int == 1:
+            copied_circuit = circuit.copy()
+            copied_circuit.remove_final_measurements()
+            return copied_circuit
+        
+        # Remove measurements for folding
+        circuit_no_measure = circuit.copy()
+        circuit_no_measure.remove_final_measurements()
+        
+        number_of_folds = (scale_int - 1) // 2
+        
+        # Create folded circuit
+        folded_circuit = QuantumCircuit(circuit.num_qubits)
+
+        if folding_method=='gate':
+            # Get gates to fold (excluding barriers)
+            gates_to_fold = []
+            for instruction in circuit_no_measure.data:
+                if instruction.operation.name not in ['barrier']:
+                    gates_to_fold.append(instruction)
+        
+            for instruction in gates_to_fold:
+                folded_circuit.append(instruction.operation, instruction.qubits)
+                
+                for _ in range(number_of_folds):
+                    folded_circuit.append(instruction.operation, instruction.qubits)
+                    folded_circuit.append(instruction.operation.inverse(), instruction.qubits)
+
+        elif folding_method=='circuit':
+            # Apply original circuit
+            folded_circuit.compose(circuit_no_measure, inplace=True)
+            
+            # Apply folding pairs (circuit + inverse circuit)
+            for _ in range(number_of_folds):
+                folded_circuit.compose(circuit_no_measure, inplace=True)
+                folded_circuit.compose(circuit_no_measure.inverse(), inplace=True)
+        else:
+            raise ValueError("Unknown folding method. Possible values are 'gate' and 'circuit'.")
+        
+        folded_circuit.metadata = {'scale_factor': scale_factor, 'folding_method': folding_method}
+        
+        return folded_circuit

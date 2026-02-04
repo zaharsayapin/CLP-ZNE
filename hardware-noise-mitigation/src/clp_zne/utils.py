@@ -398,3 +398,11 @@ def get_grid_entanglement(rows, cols):
             if i + 1 < rows:
                 links.append([curr, curr + cols])
     return links
+
+def linear_extrapolation(x: np.ndarray, y: np.ndarray) -> float:
+    """Linear extrapolation to zero."""
+    if len(x) < 2:
+        return y[0]
+    
+    coeffs = np.polyfit(x, y, 1)
+    return coeffs[1]  # y-intercept
