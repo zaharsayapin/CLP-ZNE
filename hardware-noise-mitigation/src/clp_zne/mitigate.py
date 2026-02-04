@@ -227,7 +227,7 @@ def compute_evals(circuits, layouts, observables, noise_model):
 
     return np.array(evals_noisy).T
 
-def CLP_ZNE_mitigate(abstract_cirquit, observables, layouts, backend, noise_model, transpiled_circuits=None):
+def CLP_ZNE_mitigate(abstract_cirquit, observables, layouts, backend, noise_model):
     # Check that exactly 5 layouts are provided
     assert len(layouts) == 5
     
@@ -239,10 +239,9 @@ def CLP_ZNE_mitigate(abstract_cirquit, observables, layouts, backend, noise_mode
     for cycle in layouts:
         layout_cycles.extend(cyclic_permutations(cycle))
         
-    if transpiled_circuits is None:
-        # Create passmanagers for transpiling
-        transpiled_circuits = transpile_to_layouts(abstract_cirquit, 
-                                                   layout_cycles, target, add_measurements=False, dynamical_decoupling=False)
+    # Create passmanagers for transpiling
+    transpiled_circuits = transpile_to_layouts(abstract_cirquit, 
+                                                layout_cycles, target, add_measurements=False, dynamical_decoupling=False)
 
     # Compute error sums
     q1_avg = []
@@ -283,6 +282,8 @@ def CLP_ZNE_mitigate(abstract_cirquit, observables, layouts, backend, noise_mode
         error_sums.append(X)
 
     return evals_mitigated, evals_noisy, error_sums
+
+
 
 def ZNE_mitigate(circuit, observables, layout, backend, noise_model, folding_method='gate'):
     """
