@@ -195,6 +195,47 @@ def get_contibution_infidelities_with_single_qubit_errors(backend, tcirc, atol=1
             
     return T1_up_infidelities, T_phi_up_infidelities, depol_infidelities_1, depol_infidelities_2
 
+def compute_error_sum(backend, circuit, cycle, connection_type):
+    def minimal_number_of_neighbours_between(arr, val1, val2):
+        # Check if both values exist in the list
+        if val1 not in arr:
+            raise ValueError(f"Value '{val1}' not found in the provided list.")
+        if val2 not in arr:
+            raise ValueError(f"Value '{val2}' not found in the provided list.")
+        
+        # Check if the values are the same
+        if val1 == val2:
+            raise ValueError("Both values are the same; distance cannot be calculated between identical elements.")
+
+        # Get the indices of the two numbers
+        idx1 = arr.index(val1)
+        idx2 = arr.index(val2)
+        
+        n = len(arr)
+        
+        # Calculate the absolute jump between indices
+        d = abs(idx1 - idx2)
+        
+        # The shortest "jump" distance in a cycle is min(d, n - d)
+        shortest_jump = min(d, n - d)
+
+        return shortest_jump - 1
+    
+    qubits_satisfy_connection_type = lambda qubits, cycle, connection_type: minimal_number_of_neighbours_between(cycle, *qubits) == connection_type
+
+    target = backend.target
+    error_sum =0
+    for instruction in circuit.data:
+        gate = instruction.operation
+        gate_name = gate.name
+        qubits = tuple(circuit.find_bit(qubit)[0] for qubit in instruction.qubits)
+
+        if gate_name=='cz':
+            error_sum += target[gate_name][qubits].error if qubits_satisfy_connection_type(qubits, cycle, connection_type) else 0
+
+    return error_sum
+
+
 
 def compute_evals(circuits, layouts, observables, noise_model):
     aer_circuits = []
@@ -227,7 +268,7 @@ def compute_evals(circuits, layouts, observables, noise_model):
 
     return np.array(evals_noisy).T
 
-def CLP_ZNE_mitigate(abstract_cirquit, observables, layouts, backend, noise_model):
+def clp_zne_mitigate_1d_topology_circuit(abstract_cirquit, observables, layouts, backend, noise_model):
     # Check that exactly 5 layouts are provided
     assert len(layouts) == 5
     
@@ -283,9 +324,63 @@ def CLP_ZNE_mitigate(abstract_cirquit, observables, layouts, backend, noise_mode
 
     return evals_mitigated, evals_noisy, error_sums
 
+def reshape(data, rows, cols):
+    if len(data) != rows * cols:
+        raise ValueError("Total elements must match the new shape.")
+    return [data[i * cols : (i + 1) * cols] for i in range(rows)]
+
+def clp_zne_mitigate_general_topology_circuit(circuit, observables, layout_cycles, backend, noise_model):
+    num_qubits = circuit.num_qubits
+    num_connection_types = num_qubits // 2
+    target = backend.target
+
+    #assert len(layout_cycles) == num_connection_types + 1
+
+    # Generate cyclic layout permutations (CLP)
+    cyclically_permuted_layouts = []
+    for cycle in layout_cycles:
+        cyclically_permuted_layouts.extend(cyclic_permutations(cycle))
+
+    # Create passmanagers for transpiling
+    transpiled_circuits = transpile_to_layouts(circuit, cyclically_permuted_layouts, target,
+                                                add_measurements=False, dynamical_decoupling=False)
+    transpiled_circuits_reshaped = reshape(transpiled_circuits, len(layout_cycles), num_qubits)
+    
+    # Compute error sums
+    error_mtx = np.zeros((len(layout_cycles), num_connection_types))
+    for cycle_idx, cycle in enumerate(layout_cycles):
+        for connection_type in range(num_connection_types):
+            errors = [compute_error_sum(backend, tcirc, cycle, connection_type) for tcirc in transpiled_circuits_reshaped[cycle_idx]]
+            average_error = np.mean(errors)
+            error_mtx[cycle_idx, connection_type] = average_error
+    print(error_mtx)
+    # Run with noise
+    print("Running density matrix simulations")
+    evals_noisy = compute_evals(transpiled_circuits, layouts=np.array(cyclically_permuted_layouts)[:, :num_qubits],
+                                    observables=observables, noise_model=noise_model)
+    # Iterate over observables
+    error_sums = []
+    evals_mitigated = []
+    for i, observable in enumerate(observables):
+        # Perform averaging
+        X = error_mtx
+        y_data = evals_noisy[i]
+        y = y_data.reshape((len(layout_cycles), -1)).mean(axis=1).reshape((len(layout_cycles), 1))
+
+        X_with_intercept = np.column_stack([np.ones(X.shape[0]), X])
+
+        coeffs = X_with_intercept.T @ np.linalg.inv(X_with_intercept @ X_with_intercept.T) @ y
+        
+        eval_mitigated = coeffs[0, 0]
+
+        evals_mitigated.append(eval_mitigated)
+        error_sums.append(X)
+
+    return evals_mitigated, evals_noisy, error_sums
 
 
-def ZNE_mitigate(circuit, observables, layout, backend, noise_model, folding_method='gate'):
+
+def zne_mitigate(circuit, observables, layout, backend, noise_model, folding_method='gate'):
     """
     Implements Digital Zero-Noise Extrapolation.
     
