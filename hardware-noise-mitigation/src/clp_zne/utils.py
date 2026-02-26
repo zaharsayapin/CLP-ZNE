@@ -72,7 +72,7 @@ def compute_evals(circuits, layouts, observables, noise_model):
     simulator = AerSimulator(method='density_matrix')
     
     evals_noisy = []
-    for circuit in tqdm(aer_circuits):
+    for circuit in aer_circuits:
         result = simulator.run(circuit).result()
         density_matrix = np.asarray(result.data(0)['density_matrix'])
 
