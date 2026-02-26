@@ -3,7 +3,6 @@ Reimplementation of NoiseModel.from_backend() (qiskit-aer)
 """
 
 from typing import Optional, Tuple, Dict, Any, List
-from ..fidelity import therm_infidelity
 from qiskit.quantum_info import average_gate_fidelity
 
 import math
