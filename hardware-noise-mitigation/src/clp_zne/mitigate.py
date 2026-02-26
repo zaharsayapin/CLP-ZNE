@@ -1,201 +1,144 @@
-from qiskit import QuantumCircuit
-from qiskit_aer.utils import insert_noise
-from qiskit_aer import AerSimulator
-from qiskit.quantum_info import DensityMatrix
-from qiskit_aer.noise import depolarizing_error, thermal_relaxation_error
-from qiskit.quantum_info import average_gate_fidelity, SuperOp, Operator
-from .utils import build_subset_circuit, transpile_to_layouts, cyclic_permutations, linear_extrapolation
+from dataclasses import dataclass
 import warnings
-from tqdm import tqdm
+
 import numpy as np
 
-def get_t1_t2(props, q):
-    # try multiple APIs (works with BackendProperties v1+)
-    for fn in ('t1', 'T1',):
-        try:
-            val = getattr(props, fn)(q)
-            return val, getattr(props, 't2')(q)
-        except Exception:
-            pass
-    # fallback to qubit_property if available
-    try:
-        t1 = props.qubit_property(q, 'T1')[0]
-        t2 = props.qubit_property(q, 'T2')[0]
-        return t1, t2
-    except Exception:
-        return None, None
+from qiskit import QuantumCircuit
+from qiskit.quantum_info import SuperOp, average_gate_fidelity
+from qiskit_aer.noise import thermal_relaxation_error
 
-def get_contibution_infidelities_with_single_qubit_errors(backend, tcirc, atol=1e-10, verbose=False):
-    props = backend.properties()
+from .utils import (
+    transpile_to_layouts,
+    cyclic_permutations,
+    compute_evals,
+    linear_extrapolation
+)
+from .noise import noise_model_from_backend
 
-    T1_up_infidelities = []
-    T_phi_up_infidelities = []
-    depol_infidelities_1 = []
-    depol_infidelities_2 = []
+@dataclass
+class ErrorProfile:
+    """Container for multi-parameter error breakdown of a circuit."""
+    d1: float = 0.0      # Depol 1q
+    d2: float = 0.0      # Depol 2q
+    t1_1: float = 0.0    # T1-related infidelity 1q
+    tp_1: float = 0.0    # T-phi-related infidelity 1q
+    t1_2: float = 0.0    # T1-related infidelity 2q
+    tp_2: float = 0.0    # T-phi-related infidelity 2q
+    therm1: float = 0.0  # Composite thermal infidelity 1q
+    therm2: float = 0.0  # Composite thermal infidelity 2q
+    total1: float = 0.0  # Total gate_error 1q
+    total2: float = 0.0  # Total gate_error 2q
+
+    def get_features(self, option: int) -> np.ndarray:
+        """Projects the 10 parameters into N features based on ZNE option."""
+        mapping = {
+            1: [self.total2],
+            2: [self.d2, self.therm2],
+            3: [self.d2, self.t1_2, self.tp_2],
+            4: [self.d2, self.t1_2, self.tp_2, self.d1],
+            5: [self.d2, self.t1_2, self.tp_2, self.d1, self.therm1],
+            6: [self.d2, self.t1_2, self.tp_2, self.d1, self.t1_1, self.tp_1]
+        }
+        return np.array(mapping.get(option, [self.total2]))
+
+# This function populates the `ErrorProfile` by analyzing every gate in the transpiled circuit.
+def calculate_circuit_error_profile(backend, tcirc, noise_model, therm_noise_multiplier=1, assume_uniform_2q_gate_duration=True):
+    profile = ErrorProfile()
     
     for inst in tcirc.data:
         op = inst.operation
-        # skip non-gate ops
-        if op is None or op.name is None or op.name=='rz':
+        if op is None or op.name in [None, 'rz', 'barrier', 'measure']:
             continue
             
-        if len(inst.qubits) == 2:
-            assert len(inst.qubits) == 2
-            name = op.name
-            # map instruction qubits -> integer indices in the transpiled circuit
-            qubits = tuple(tcirc.qubits.index(q) for q in inst.qubits)
-            n_q = len(qubits)
-            # get backend-reported gate_error and gate_length (seconds)
-            try:
-                gate_err = props.gate_error(name, qubits)
-            except Exception:
-                gate_err = None
-            try:
-                gate_time = props.gate_length(name, qubits)  # seconds
-            except Exception:
-                gate_time = None
-
-            # get per-qubit T1/T2 and create single-qubit thermal errors (or identity)
-            therm_errors = []
-            for i, q in enumerate(qubits):
-                t1, t2 = get_t1_t2(props, q)
-                t2 = min(t2, 2*t1)
-
-                if i == 0:
-                    T1_up_inf = 1 - (2+np.exp(-gate_time/t1)+2*np.exp(-gate_time/(2*t1)))/5
-                    T_phi_inv = 1/t2 - 1/(2*t1)
-                    T_phi_up_inf = 1 - (3+2*np.exp(-gate_time*T_phi_inv))/5
-
-                    T1_up_infidelities.append(T1_up_inf)
-                    T_phi_up_infidelities.append(T_phi_up_inf)
-
-                if t1 is None or t2 is None or gate_time is None:
-                    therm_errors.append(depolarizing_error(0.0, 1))
-                else:
-                    therm_errors.append(thermal_relaxation_error(t1, t2, gate_time))
-
-            # build joint thermal error (tensor of single-qubit thermal errors)
-            therm = therm_errors[0]
-            for e in therm_errors[1:]:
-                therm = therm.tensor(e)
-
-            # average fidelity and infidelity of thermal part
-            try:
-                superop_therm = SuperOp(therm)
-                dim = 2 ** n_q
-                identity = Operator(np.identity(dim))
-                f_th = average_gate_fidelity(superop_therm, identity)
-            except Exception:
-                f_th = 1.0
-            inf_th = max(0.0, 1.0 - f_th)
-
-            # If backend doesn't report gate_error, Qiskit.from_backend will typically
-            # insert only thermal errors (no depolarizing) — we mirror that.
-            if gate_err is None:
-                raise ValueError("Gate_err is None")
-                if verbose:
-                    print(f"{name}{qubits}: gate_err=N/A, thermal_inf={inf_th:.3e}, depol_inf=0")
-                continue
-
-
-            # if thermal infidelity >= reported gate_error, Qiskit uses thermal only
-            if inf_th >= gate_err - atol:
-                depol_infidelities_2.append(0)
-                if verbose:
-                    print(f"{name}{qubits}: gate_err={gate_err:.3e}, thermal_inf={inf_th:.3e} (>= gate_err) -> no depol")
-                continue
-
-            # otherwise find depolarizing parameter λ so that
-            # average_fidelity( depol(λ) ∘ thermal ) == 1 - gate_err
-            target_f = 1.0 - gate_err
-
-            depol_inf = 3/4*(f_th-target_f)/(f_th-1/4)
-            depol_infidelities_2.append(depol_inf)      
-
-            if verbose:
-                 print(f"{name}{qubits}: gate_err={gate_err:.3e}, thermal_inf={inf_th:.3e}, depol_inf={depol_inf:.3e}")
+        qubits = tuple(tcirc.qubits.index(q) for q in inst.qubits)
+        n_q = len(qubits)
+        name = op.name
         
-        elif len(inst.qubits) == 1:
-            assert len(inst.qubits) == 1
-            name = op.name
-            # map instruction qubits -> integer indices in the transpiled circuit
-            qubits = tuple(tcirc.qubits.index(q) for q in inst.qubits)
-            n_q = len(qubits)
-            # get backend-reported gate_error and gate_length (seconds)
-            try:
-                gate_err = props.gate_error(name, qubits)
-            except Exception:
-                gate_err = None
-            try:
-                gate_time = props.gate_length(name, qubits)  # seconds
-            except Exception:
-                gate_time = None
+        # 1. Fetch Backend reported values
+        gate_err = backend.target[name][qubits].error
+        if gate_err is None:
+            raise ValueError(f"Not found error info for {name} on qubits {qubits}")
+        
+        gate_time = backend.target[name][qubits].duration
+        if gate_time is None:
+            raise ValueError(f"Not found gate duration info for {name} on qubits {qubits}")
+        
+        # 2. Calculate Thermal Components
+        therm_ops = []
+        t1_sum, tphi_sum = 0.0, 0.0
+        
+        for i, q in enumerate(qubits):
+            t1 = backend.qubit_properties(q).t1
+            t2 = backend.qubit_properties(q).t2
 
-            # get per-qubit T1/T2 and create single-qubit thermal errors (or identity)
-            therm_errors = []
-            for i, q in enumerate(qubits):
-                t1, t2 = get_t1_t2(props, q)
-                t2 = min(t2, 2*t1)
-
-                if i == 0:
-                    T1_up_inf = 1 - (2+np.exp(-gate_time/t1)+2*np.exp(-gate_time/(2*t1)))/5
-                    T_phi_inv = 1/t2 - 1/(2*t1)
-                    T_phi_up_inf = 1 - (3+2*np.exp(-gate_time*T_phi_inv))/5
-                    
-                    
-                    #T1_up_infidelities.append(T1_up_inf)
-                    #T_phi_up_infidelities.append(T_phi_up_inf)
-
-                if t1 is None or t2 is None or gate_time is None:
-                    therm_errors.append(depolarizing_error(0.0, 1))
-                    raise ValueError()
-                else:
-                    therm_errors.append(thermal_relaxation_error(t1, t2, gate_time))
-
-            # build joint thermal error (tensor of single-qubit thermal errors)
-            therm = therm_errors[0]
-            for e in therm_errors[1:]:
-                therm = therm.tensor(e)
-
-            # average fidelity and infidelity of thermal part
-            try:
-                superop_therm = SuperOp(therm)
-                dim = 2 ** n_q
-                identity = Operator(np.identity(dim))
-                f_th = average_gate_fidelity(superop_therm, identity)
-            except Exception:
-                f_th = 1.0
-            inf_th = max(0.0, 1.0 - f_th)
-
-            # If backend doesn't report gate_error, Qiskit.from_backend will typically
-            # insert only thermal errors (no depolarizing) — we mirror that.
-            if gate_err is None:
-                raise ValueError("Gate_err is None")
-                if verbose:
-                    print(f"{name}{qubits}: gate_err=N/A, thermal_inf={inf_th:.3e}, depol_inf=0")
-                continue
-
-
-            # if thermal infidelity >= reported gate_error, Qiskit uses thermal only
-            if inf_th >= gate_err - atol:
-                depol_infidelities_1.append(0)
-                if verbose:
-                    print(f"{name}{qubits}: gate_err={gate_err:.3e}, thermal_inf={inf_th:.3e} (>= gate_err) -> no depol")
-                continue
-
-            # otherwise find depolarizing parameter λ so that
-            # average_fidelity( depol(λ) ∘ thermal ) == 1 - gate_err
-            target_f = 1.0 - gate_err
-
-            depol_inf = 1/2*(f_th-target_f)/(f_th-1/2)
-            depol_infidelities_1.append(depol_inf)      
-
-            if verbose:
-                 print(f"{name}{qubits}: gate_err={gate_err:.3e}, thermal_inf={inf_th:.3e}, depol_inf={depol_inf:.3e}")
+            if t1 is None or t2 is None:
+                raise ValueError(f"Not found T1/T2 times for qubit {q}")
             
-    return T1_up_infidelities, T_phi_up_infidelities, depol_infidelities_1, depol_infidelities_2
+            t2 = min(t2, 2*t1)
+            t1 /= therm_noise_multiplier
+            t2 /= therm_noise_multiplier
 
-def compute_error_sum(backend, circuit, cycle, connection_type):
+            therm_ops.append(thermal_relaxation_error(t1, t2, gate_time))
+            
+            if n_q == 1:
+                # Avg. fidelity of single qubit T1-noise: F_t1 = (3 + exp(-t/T1) + 2*exp(-t/2T1))/6
+                t1_inf = 1 - (3 + np.exp(-gate_time/t1) + 2*np.exp(-gate_time/(2*t1)))/6
+
+                # Avg. fidelity of single qubit T_phi-noise: F_tp = (2 + exp(-t/Tp))/3
+                tp_inv = 1/t2 - 1/(2*t1)
+                tp_inf = 1 - (2 + np.exp(-gate_time * tp_inv))/3
+            elif n_q == 2:
+                # Avg. fidelity of two qubit T1-noise, where it acts only on one of the qubits: F_t1 = (2 + exp(-t/T1) + 2*exp(-t/2T1))/5
+                t1_inf = 1 - (2 + np.exp(-gate_time/t1) + 2*np.exp(-gate_time/(2*t1)))/5
+
+                # Avg. fidelity of two qubit T_phi-noise, where it acts only on one of the qubits: F_tp = (3 + 2*exp(-t/2T1))/5
+                tp_inv = 1/t2 - 1/(2*t1)
+                tp_inf = 1 - (3 + 2*np.exp(-gate_time * tp_inv))/5
+
+            # This is added in order to be able to reproduce older version of the code, which was used for the preprit of the article
+            # If 2-qubit gate times are the same, than the mitigated values will not differ between the code versions
+            if assume_uniform_2q_gate_duration and (i == 1):
+                t1_inf = 0
+                tp_inf = 0
+
+            t1_sum += t1_inf
+            tphi_sum += tp_inf
+
+        # Composite Thermal Error
+        therm_joint = therm_ops[0]
+        for e in therm_ops[1:]: therm_joint = therm_joint.tensor(e)
+        f_th = average_gate_fidelity(SuperOp(therm_joint))
+        inf_th = max(0.0, 1.0 - f_th)
+
+        # 3. Calculate depolarizing residual error
+        # Assume the noise structure: depol ∘ thermal,
+        # where thermal noise being applied first
+        d = 2**n_q
+        inf_depol = max(0, (d-1)/d*(f_th-(1-gate_err))/(f_th-1/d))
+
+        try:
+            error_obj = noise_model._local_quantum_errors[name][qubits]
+        except:
+            error_obj = noise_model._local_quantum_errors[name][qubits[::-1]]
+        total_gate_error = 1 - average_gate_fidelity(error_obj)
+
+        # 4. Update Profile
+        if n_q == 1:
+            profile.total1 += total_gate_error
+            profile.d1 += inf_depol
+            profile.t1_1 += t1_sum
+            profile.tp_1 += tphi_sum
+            profile.therm1 += inf_th
+        elif n_q == 2:
+            profile.total2 += total_gate_error
+            profile.d2 += inf_depol
+            profile.t1_2 += t1_sum
+            profile.tp_2 += tphi_sum
+            profile.therm2 += inf_th
+            
+    return profile
+
+def compute_error_sum(noise_model, circuit, cycle, connection_type):
     def minimal_number_of_neighbours_between(arr, val1, val2):
         # Check if both values exist in the list
         if val1 not in arr:
@@ -223,118 +166,124 @@ def compute_error_sum(backend, circuit, cycle, connection_type):
     
     qubits_satisfy_connection_type = lambda qubits, cycle, connection_type: minimal_number_of_neighbours_between(cycle, *qubits) == connection_type
 
-    target = backend.target
-    error_sum =0
+    error_sum = 0
     for instruction in circuit.data:
         gate = instruction.operation
         gate_name = gate.name
         qubits = tuple(circuit.find_bit(qubit)[0] for qubit in instruction.qubits)
 
         if gate_name=='cz':
-            error_sum += target[gate_name][qubits].error if qubits_satisfy_connection_type(qubits, cycle, connection_type) else 0
+            try:
+                error_obj = noise_model._local_quantum_errors[gate_name][qubits]
+            except:
+                error_obj = noise_model._local_quantum_errors[gate_name][qubits[::-1]]
+            total_gate_error = 1 - average_gate_fidelity(error_obj)
 
+            if qubits_satisfy_connection_type(qubits, cycle, connection_type):
+                error_sum += total_gate_error
     return error_sum
 
-
-
-def compute_evals(circuits, layouts, observables, noise_model):
-    aer_circuits = []
+def get_error_matrix(circuit, layout_cycles, backend, num_params=1, therm_noise_multiplier=1, assume_uniform_2q_gate_duration=True):
+    # 1. Prepare Layouts and Transpile
+    cyclically_permuted_layouts = []
+    for cycle in layout_cycles:
+        cyclically_permuted_layouts.extend(cyclic_permutations(cycle))
     
-    for i, circuit in enumerate(circuits):
-        subset_qubits = layouts[i]
-        qubit_mapping = {orig: idx for idx, orig in enumerate(subset_qubits)}
-        circ = insert_noise(circuit, noise_model)
-        circ = build_subset_circuit(circ, subset_qubits, qubit_mapping)
-        circ.save_state()
-        aer_circuits.append(circ)
-    #####
-    simulator = AerSimulator(method='density_matrix')
+    transpiled_circs = transpile_to_layouts(circuit, cyclically_permuted_layouts, backend.target)
     
-    evals_noisy = []
-    for circuit in tqdm(aer_circuits):
-        result = simulator.run(circuit).result()
-        density_matrix = np.asarray(result.data(0)['density_matrix'])
-
-        if not isinstance(density_matrix, DensityMatrix):
-            density_matrix = DensityMatrix(density_matrix)
-        
-        evs = []
-        for observable in tqdm(observables):
-            evs.append(density_matrix.expectation_value(observable).real)
-            #observable_matrix = observable.to_matrix()
-            #evs.append(np.trace(density_matrix @ observable_matrix).real)
-
-        evals_noisy.append(evs)
-
-    return np.array(evals_noisy).T
-
-def clp_zne_mitigate_1d_topology_circuit(abstract_cirquit, observables, layouts, backend, noise_model):
-    # Check that exactly 5 layouts are provided
-    assert len(layouts) == 5
+    # 2. Build Feature Matrix X
+    print("Calculating error profiles...")
+    profiles = [calculate_circuit_error_profile(backend, c, therm_noise_multiplier, assume_uniform_2q_gate_duration) for c in transpiled_circs]
     
-    n_qubits = abstract_cirquit.num_qubits
-    target = backend.target
-
-    # Generate cyclic layout permutations (CLP)
-    layout_cycles = []
-    for cycle in layouts:
-        layout_cycles.extend(cyclic_permutations(cycle))
-        
-    # Create passmanagers for transpiling
-    transpiled_circuits = transpile_to_layouts(abstract_cirquit, 
-                                                layout_cycles, target, add_measurements=False, dynamical_decoupling=False)
-
-    # Compute error sums
-    q1_avg = []
-    q2_avg = []
-    q3_avg = []
-    q4_avg = []
-    for i, circuit in enumerate(transpiled_circuits):
-        if i % 12==0:
-            q1, q2, q3, q4 = get_contibution_infidelities_with_single_qubit_errors(backend, circuit, verbose=False)
-            if np.sum(q1) >= 1 or np.sum(q2) >= 1 or np.sum(q3) >= 1 or np.sum(q4) >= 1:
-                raise ValueError('Something went wrong!!!!!1111!1')
-            q1_avg.append(np.sum(q1))
-            q2_avg.append(np.sum(q2))
-            q3_avg.append(np.sum(q3))
-            q4_avg.append(np.sum(q4))
-    error_mtx = np.column_stack((q1_avg, q2_avg, q3_avg, q4_avg))
+    # Group profiles by layout groups to match the averaging in CLP
+    group_size = len(cyclically_permuted_layouts) // len(layout_cycles)
     
-    # Run with noise
-    print("Running density matrix simulations")
-    evals_noisy = compute_evals(transpiled_circuits, layouts=np.array(layout_cycles)[:, :n_qubits],
-                                    observables=observables, noise_model=noise_model)
-    # Iterate over observables
-    error_sums = []
+    X_list = []
+    for i in range(0, len(profiles), group_size):
+        group = profiles[i : i + group_size]
+        # Average the features across the cyclic permutations
+        avg_features = np.mean([p.get_features(num_params) for p in group], axis=0)
+        X_list.append(avg_features)
+    
+    X = np.array(X_list) # Shape (len(layout_cycles), n_features)
+    return X
+
+def clp_zne_mitigate_1d_topology_circuit(circuit, observables, layout_cycles, backend, num_params=1,
+                                         therm_noise_multiplier=1, assume_uniform_2q_gate_duration=True):
+    """
+    ZNE Mitigation using Cyclic Layout Permutations.
+    
+    Args:
+        num_params: 1 (Total 2Q) to 6 (Full breakdown).
+    """
+    n_qubits = circuit.num_qubits
+    
+    # 1. Prepare Layouts and Transpile
+    cyclically_permuted_layouts = []
+    for cycle in layout_cycles:
+        cyclically_permuted_layouts.extend(cyclic_permutations(cycle))
+    
+    transpiled_circs = transpile_to_layouts(circuit, cyclically_permuted_layouts, backend.target)
+    
+    # Build noise model
+    noise_model = noise_model_from_backend(
+        backend,
+        add_readout=False,
+        add_gate_errors= True,
+        thermal_relaxation= True,
+        therm_error_multiplier=therm_noise_multiplier,
+        warnings= False,
+    )
+
+    # 2. Build Feature Matrix X
+    print("Calculating error profiles...")
+    profiles = [calculate_circuit_error_profile(backend, c, noise_model, therm_noise_multiplier, assume_uniform_2q_gate_duration) for c in transpiled_circs]
+    
+    # Group profiles by layout groups to match the averaging in CLP
+    group_size = len(cyclically_permuted_layouts) // len(layout_cycles)
+    
+    X_list = []
+    for i in range(0, len(profiles), group_size):
+        group = profiles[i : i + group_size]
+        # Average the features across the cyclic permutations
+        avg_features = np.mean([p.get_features(num_params) for p in group], axis=0)
+        X_list.append(avg_features)
+    
+    X = np.array(X_list) # Shape (len(layout_cycles), n_features)
+    X_with_intercept = np.column_stack([np.ones(X.shape[0]), X])
+
+    # 3. Run Noisy Simulations
+    print("Running simulations...")
+    evals_noisy = compute_evals(
+        transpiled_circs, 
+        layouts=np.array(cyclically_permuted_layouts)[:, :n_qubits],
+        observables=observables, 
+        noise_model=noise_model
+    )
+    
+    # 4. Perform Multi-Parameter Regression
     evals_mitigated = []
-    for i, observable in enumerate(observables):
-        # Perform averaging
-        X = error_mtx
-        y_data = evals_noisy[i]
-        y = y_data.reshape((5, -1)).mean(axis=1).reshape((5, 1))
-
-        X_with_intercept = np.column_stack([np.ones(X.shape[0]), X])
-
-        coeffs = np.linalg.inv(X_with_intercept.T @ X_with_intercept) @ X_with_intercept.T @ y
+    for obs_idx in range(len(observables)):
+        # Average noisy results across permutations
+        y_data = evals_noisy[obs_idx]
+        y = y_data.reshape((len(layout_cycles), -1)).mean(axis=1)
         
-        eval_mitigated = coeffs[0, 0]
-
-        evals_mitigated.append(eval_mitigated)
-        error_sums.append(X)
-
-    return evals_mitigated, evals_noisy, error_sums
+        coeffs, _, _, _ = np.linalg.lstsq(X_with_intercept, y, rcond=None)
+        
+        # The first coefficient is the intercept (noise -> 0 limit)
+        evals_mitigated.append(coeffs[0])
+        
+    return evals_mitigated, evals_noisy, X
 
 def reshape(data, rows, cols):
     if len(data) != rows * cols:
         raise ValueError("Total elements must match the new shape.")
     return [data[i * cols : (i + 1) * cols] for i in range(rows)]
 
-def clp_zne_mitigate_general_topology_circuit(circuit, observables, layout_cycles, backend, noise_model):
+def clp_zne_mitigate_general_topology_circuit(circuit, observables, layout_cycles, backend, therm_noise_multiplier=1):
     num_qubits = circuit.num_qubits
     num_connection_types = num_qubits // 2
     target = backend.target
-
-    #assert len(layout_cycles) == num_connection_types + 1
 
     # Generate cyclic layout permutations (CLP)
     cyclically_permuted_layouts = []
@@ -355,6 +304,15 @@ def clp_zne_mitigate_general_topology_circuit(circuit, observables, layout_cycle
             error_mtx[cycle_idx, connection_type] = average_error
     print(error_mtx)
     # Run with noise
+    # Build noise model
+    noise_model = noise_model_from_backend(
+        backend,
+        add_readout=False,
+        add_gate_errors= True,
+        thermal_relaxation= True,
+        therm_error_multiplier=therm_noise_multiplier,
+    )
+       
     print("Running density matrix simulations")
     evals_noisy = compute_evals(transpiled_circuits, layouts=np.array(cyclically_permuted_layouts)[:, :num_qubits],
                                     observables=observables, noise_model=noise_model)
@@ -378,9 +336,7 @@ def clp_zne_mitigate_general_topology_circuit(circuit, observables, layout_cycle
 
     return evals_mitigated, evals_noisy, error_sums
 
-
-
-def zne_mitigate(circuit, observables, layout, backend, noise_model, folding_method='gate'):
+def zne_mitigate(circuit, observables, layout, backend, therm_noise_multiplier=1, folding_method='gate'):
     """
     Implements Digital Zero-Noise Extrapolation.
     
@@ -402,6 +358,15 @@ def zne_mitigate(circuit, observables, layout, backend, noise_model, folding_met
         scaled_circuits.append(fold_circuit(transpiled_circuit, scale_factor, folding_method=folding_method))
 
     # Run with noise
+    # Build noise model
+    noise_model = noise_model_from_backend(
+        backend,
+        add_readout=False,
+        add_gate_errors= True,
+        thermal_relaxation= True,
+        therm_error_multiplier=therm_noise_multiplier,
+        warnings= False,
+    )
     print("Running density matrix simulations")
     evals_noisy = compute_evals(scaled_circuits, layouts=np.array([layout]*len(scaled_circuits))[:, :n_qubits],
                                     observables=observables, noise_model=noise_model)
@@ -415,62 +380,62 @@ def zne_mitigate(circuit, observables, layout, backend, noise_model, folding_met
     return evals_mitigated, evals_noisy
 
 def fold_circuit(circuit: QuantumCircuit, scale_factor: float, folding_method='gate') -> QuantumCircuit:
-        """
-        Fold a quantum circuit to amplify noise. Removes all end circuit measurments.
+    """
+    Fold a quantum circuit to amplify noise. Removes all end circuit measurments.
+    
+    Args:
+        circuit: Original quantum circuit
+        scale_factor: Noise amplification factor (must be odd: 1, 3, 5, ...)
+        folding_method: method to use for noise amplification. Possible values are 'gate' and 'circuit' to perform unitary gate folding and unitary circuit folding respectivly. By default is 'gate'.
         
-        Args:
-            circuit: Original quantum circuit
-            scale_factor: Noise amplification factor (must be odd: 1, 3, 5, ...)
-            folding_method: method to use for noise amplification. Possible values are 'gate' and 'circuit' to perform unitary gate folding and unitary circuit folding respectivly. By default is 'gate'.
-            
-        Returns:
-            Folded quantum circuit
-        """
-        if scale_factor < 1 or int(scale_factor) % 2 == 0:
-            warnings.warn(f"Scale factor {scale_factor} adjusted to nearest odd integer ≥ 1")
-            scale_factor = max(1, 2 * int(np.ceil((scale_factor - 1) / 2)) + 1)
-        
-        scale_int = int(scale_factor)
-        
-        if scale_int == 1:
-            copied_circuit = circuit.copy()
-            copied_circuit.remove_final_measurements()
-            return copied_circuit
-        
-        # Remove measurements for folding
-        circuit_no_measure = circuit.copy()
-        circuit_no_measure.remove_final_measurements()
-        
-        number_of_folds = (scale_int - 1) // 2
-        
-        # Create folded circuit
-        folded_circuit = QuantumCircuit(circuit.num_qubits)
+    Returns:
+        Folded quantum circuit
+    """
+    if scale_factor < 1 or int(scale_factor) % 2 == 0:
+        warnings.warn(f"Scale factor {scale_factor} adjusted to nearest odd integer ≥ 1")
+        scale_factor = max(1, 2 * int(np.ceil((scale_factor - 1) / 2)) + 1)
+    
+    scale_int = int(scale_factor)
+    
+    if scale_int == 1:
+        copied_circuit = circuit.copy()
+        copied_circuit.remove_final_measurements()
+        return copied_circuit
+    
+    # Remove measurements for folding
+    circuit_no_measure = circuit.copy()
+    circuit_no_measure.remove_final_measurements()
+    
+    number_of_folds = (scale_int - 1) // 2
+    
+    # Create folded circuit
+    folded_circuit = QuantumCircuit(circuit.num_qubits)
 
-        if folding_method=='gate':
-            # Get gates to fold (excluding barriers)
-            gates_to_fold = []
-            for instruction in circuit_no_measure.data:
-                if instruction.operation.name not in ['barrier']:
-                    gates_to_fold.append(instruction)
-        
-            for instruction in gates_to_fold:
-                folded_circuit.append(instruction.operation, instruction.qubits)
-                
-                for _ in range(number_of_folds):
-                    folded_circuit.append(instruction.operation, instruction.qubits)
-                    folded_circuit.append(instruction.operation.inverse(), instruction.qubits)
-
-        elif folding_method=='circuit':
-            # Apply original circuit
-            folded_circuit.compose(circuit_no_measure, inplace=True)
+    if folding_method=='gate':
+        # Get gates to fold (excluding barriers)
+        gates_to_fold = []
+        for instruction in circuit_no_measure.data:
+            if instruction.operation.name not in ['barrier']:
+                gates_to_fold.append(instruction)
+    
+        for instruction in gates_to_fold:
+            folded_circuit.append(instruction.operation, instruction.qubits)
             
-            # Apply folding pairs (circuit + inverse circuit)
             for _ in range(number_of_folds):
-                folded_circuit.compose(circuit_no_measure, inplace=True)
-                folded_circuit.compose(circuit_no_measure.inverse(), inplace=True)
-        else:
-            raise ValueError("Unknown folding method. Possible values are 'gate' and 'circuit'.")
+                folded_circuit.append(instruction.operation, instruction.qubits)
+                folded_circuit.append(instruction.operation.inverse(), instruction.qubits)
+
+    elif folding_method=='circuit':
+        # Apply original circuit
+        folded_circuit.compose(circuit_no_measure, inplace=True)
         
-        folded_circuit.metadata = {'scale_factor': scale_factor, 'folding_method': folding_method}
-        
-        return folded_circuit
+        # Apply folding pairs (circuit + inverse circuit)
+        for _ in range(number_of_folds):
+            folded_circuit.compose(circuit_no_measure, inplace=True)
+            folded_circuit.compose(circuit_no_measure.inverse(), inplace=True)
+    else:
+        raise ValueError("Unknown folding method. Possible values are 'gate' and 'circuit'.")
+    
+    folded_circuit.metadata = {'scale_factor': scale_factor, 'folding_method': folding_method}
+    
+    return folded_circuit
