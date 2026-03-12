@@ -285,6 +285,15 @@ def clp_zne_mitigate_general_topology_circuit(circuit, observables, layout_cycle
     num_connection_types = num_qubits // 2
     target = backend.target
 
+    # Build noise model
+    noise_model = noise_model_from_backend(
+        backend,
+        add_readout=False,
+        add_gate_errors= True,
+        thermal_relaxation= True,
+        therm_error_multiplier=therm_noise_multiplier,
+    )
+
     # Generate cyclic layout permutations (CLP)
     cyclically_permuted_layouts = []
     for cycle in layout_cycles:
@@ -299,20 +308,12 @@ def clp_zne_mitigate_general_topology_circuit(circuit, observables, layout_cycle
     error_mtx = np.zeros((len(layout_cycles), num_connection_types))
     for cycle_idx, cycle in enumerate(layout_cycles):
         for connection_type in range(num_connection_types):
-            errors = [compute_error_sum(backend, tcirc, cycle, connection_type) for tcirc in transpiled_circuits_reshaped[cycle_idx]]
+            errors = [compute_error_sum(noise_model, tcirc, cycle, connection_type) for tcirc in transpiled_circuits_reshaped[cycle_idx]]
             average_error = np.mean(errors)
             error_mtx[cycle_idx, connection_type] = average_error
     print(error_mtx)
+    
     # Run with noise
-    # Build noise model
-    noise_model = noise_model_from_backend(
-        backend,
-        add_readout=False,
-        add_gate_errors= True,
-        thermal_relaxation= True,
-        therm_error_multiplier=therm_noise_multiplier,
-    )
-       
     print("Running density matrix simulations")
     evals_noisy = compute_evals(transpiled_circuits, layouts=np.array(cyclically_permuted_layouts)[:, :num_qubits],
                                     observables=observables, noise_model=noise_model)
