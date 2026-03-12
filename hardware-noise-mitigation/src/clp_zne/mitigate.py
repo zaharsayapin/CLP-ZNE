@@ -42,7 +42,7 @@ class ErrorProfile:
         return np.array(mapping.get(option, [self.total2]))
 
 # This function populates the `ErrorProfile` by analyzing every gate in the transpiled circuit.
-def calculate_circuit_error_profile(backend, tcirc, noise_model, therm_noise_multiplier=1, assume_uniform_2q_gate_duration=True):
+def calculate_circuit_error_profile(backend, tcirc, noise_model, therm_noise_multiplier=1):
     profile = ErrorProfile()
     
     for inst in tcirc.data:
@@ -94,12 +94,6 @@ def calculate_circuit_error_profile(backend, tcirc, noise_model, therm_noise_mul
                 # Avg. fidelity of two qubit T_phi-noise, where it acts only on one of the qubits: F_tp = (3 + 2*exp(-t/2T1))/5
                 tp_inv = 1/t2 - 1/(2*t1)
                 tp_inf = 1 - (3 + 2*np.exp(-gate_time * tp_inv))/5
-
-            # This is added in order to be able to reproduce older version of the code, which was used for the preprit of the article
-            # If 2-qubit gate times are the same, than the mitigated values will not differ between the code versions
-            if assume_uniform_2q_gate_duration and (i == 1):
-                t1_inf = 0
-                tp_inf = 0
 
             t1_sum += t1_inf
             tphi_sum += tp_inf
@@ -183,7 +177,7 @@ def compute_error_sum(noise_model, circuit, cycle, connection_type):
                 error_sum += total_gate_error
     return error_sum
 
-def get_error_matrix(circuit, layout_cycles, backend, num_params=1, therm_noise_multiplier=1, assume_uniform_2q_gate_duration=True):
+def get_error_matrix(circuit, layout_cycles, backend, num_params=1, therm_noise_multiplier=1):
     # 1. Prepare Layouts and Transpile
     cyclically_permuted_layouts = []
     for cycle in layout_cycles:
@@ -193,7 +187,7 @@ def get_error_matrix(circuit, layout_cycles, backend, num_params=1, therm_noise_
     
     # 2. Build Feature Matrix X
     print("Calculating error profiles...")
-    profiles = [calculate_circuit_error_profile(backend, c, therm_noise_multiplier, assume_uniform_2q_gate_duration) for c in transpiled_circs]
+    profiles = [calculate_circuit_error_profile(backend, c, therm_noise_multiplier) for c in transpiled_circs]
     
     # Group profiles by layout groups to match the averaging in CLP
     group_size = len(cyclically_permuted_layouts) // len(layout_cycles)
@@ -209,7 +203,7 @@ def get_error_matrix(circuit, layout_cycles, backend, num_params=1, therm_noise_
     return X
 
 def clp_zne_mitigate_1d_topology_circuit(circuit, observables, layout_cycles, backend, num_params=1,
-                                         therm_noise_multiplier=1, assume_uniform_2q_gate_duration=True):
+                                         therm_noise_multiplier=1):
     """
     ZNE Mitigation using Cyclic Layout Permutations.
     
@@ -237,7 +231,7 @@ def clp_zne_mitigate_1d_topology_circuit(circuit, observables, layout_cycles, ba
 
     # 2. Build Feature Matrix X
     print("Calculating error profiles...")
-    profiles = [calculate_circuit_error_profile(backend, c, noise_model, therm_noise_multiplier, assume_uniform_2q_gate_duration) for c in transpiled_circs]
+    profiles = [calculate_circuit_error_profile(backend, c, noise_model, therm_noise_multiplier) for c in transpiled_circs]
     
     # Group profiles by layout groups to match the averaging in CLP
     group_size = len(cyclically_permuted_layouts) // len(layout_cycles)
