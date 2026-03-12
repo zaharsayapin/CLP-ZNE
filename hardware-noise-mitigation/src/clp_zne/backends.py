@@ -1,9 +1,13 @@
 import numpy as np
 import warnings
+import datetime
 from qiskit.providers.backend import BackendV2
 from qiskit.transpiler import Target, InstructionProperties
 from qiskit.circuit.library import RZGate, SXGate, XGate, CZGate, Measure, IGate
 from qiskit.providers import QubitProperties
+# V1 Models required for configuration() and properties()
+from qiskit.providers.models import QasmBackendConfiguration, BackendProperties, Nduv
+from qiskit.providers.models.backendproperties import Gate
 
 class NClusterBackend(BackendV2):
     def __init__(self, target, num_qubits, cluster_size, num_clusters):
@@ -39,7 +43,132 @@ class NClusterBackend(BackendV2):
     @classmethod
     def _default_options(cls):
         return None
+    
+    # --------------------------------------------------------------------------
+    # BackendV1 Compatibility Methods (Required for noise_model_from_backend)
+    # --------------------------------------------------------------------------
 
+    def configuration(self):
+        """
+        Returns a BackendConfiguration object compatible with Qiskit Aer's 
+        NoiseModel.from_backend() legacy expectations.
+        """
+        # Extract basis gates from Target
+        basis_gates = list(self.target.operation_names)
+        
+        # Extract coupling map from Target
+        coupling_map = []
+        cmap_obj = self.target.build_coupling_map()
+        if cmap_obj is not None:
+            coupling_map = list(cmap_obj.get_edges())
+
+        return QasmBackendConfiguration(
+            backend_name=self.name,
+            backend_version="1.0.0",
+            n_qubits=self.num_qubits,
+            basis_gates=basis_gates,
+            simulator=True,
+            local=True,
+            conditional=False,
+            open_pulse=False,
+            memory=False,
+            max_shots=int(1e6),
+            coupling_map=coupling_map,
+            # Required fields for QasmBackendConfiguration
+            gates=[], 
+            n_registers=1,
+        )
+
+
+    def properties(self):
+        """
+        Returns a BackendProperties object mapping Target data to V1 properties.
+        This allows noise_model_from_backend to extract T1, T2, gate_error, and gate_length.
+        """
+        qubit_props_list = []
+        gate_props_list = []
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        # 1. Construct Qubit Properties (T1, T2, Frequency, Readout)
+        for qp in self.target.qubit_properties:
+            nduvs = [
+                Nduv(date=now, name='T1', value=qp.t1 if qp.t1 is not None else 0.0, unit='s'),
+                Nduv(date=now, name='T2', value=qp.t2 if qp.t2 is not None else 0.0, unit='s'),
+                Nduv(date=now, name='frequency', value=5.0, unit='GHz'),
+            ]
+            
+            qubit_props_list.append(nduvs)
+
+        # 2. Construct Gate Properties (Error, Duration)
+        for op_name, qubit_map in self.target.items():
+            # Skip measurement for gate properties
+            if op_name == 'measure':
+                continue
+            
+            for qubits, props in qubit_map.items():
+                if props is None:
+                    continue
+                
+                params = []
+                # Map InstructionProperties to Nduv parameters expected by noise_model_from_backend
+                if props.error is not None:
+                    params.append(Nduv(date=now, name='gate_error', value=props.error, unit=''))
+                
+                if props.duration is not None:
+                    # Convert seconds to nanoseconds for better compatibility
+                    # Qiskit expects time units with SI prefixes
+                    duration_ns = props.duration * 1e9  # Convert s to ns
+                    params.append(Nduv(date=now, name='gate_length', value=duration_ns, unit='ns'))
+
+                gate = Gate(
+                    gate=op_name,
+                    qubits=list(qubits),
+                    date=now,
+                    parameters=params,
+                    name=op_name
+                )
+                gate_props_list.append(gate)
+
+        return BackendProperties(
+            backend_name=self.name,
+            backend_version="1.0.0",
+            last_update_date=now,
+            qubits=qubit_props_list,
+            gates=gate_props_list,
+            general=[]
+        )
+
+    def qubit_properties(self, qubit: int | list[int]):
+        """
+        Return QubitProperties for a given qubit.
+        
+        Parameters:
+            qubit (int | list[int]): The qubit to get the QubitProperties object for.
+                This can be a single integer for 1 qubit or a list of qubits and a 
+                list of QubitProperties objects will be returned in the same order.
+        
+        Returns:
+            QubitProperties | list[QubitProperties]: The QubitProperties object for 
+                the specified qubit. If a list of qubits is provided a list will be 
+                returned. If properties are missing for a qubit it will return None for that qubit.
+        """
+        
+        if isinstance(qubit, int):
+            # Single qubit: return QubitProperties object or None
+            if 0 <= qubit < self._num_qubits:
+                return self._target.qubit_properties[qubit]
+            else:
+                return None
+        elif isinstance(qubit, list):
+            # List of qubits: return list of QubitProperties objects
+            return [
+                self._target.qubit_properties[q] if 0 <= q < self._num_qubits 
+                else None 
+                for q in qubit
+            ]
+        else:
+            raise TypeError(f"Expected int or list[int] for qubit, got {type(qubit)}")
+    
     @classmethod
     def from_backend(cls, cluster_size, source_backend, list_of_index_groups, seed=None):
         params = NClusterBackend.get_parameters_for_initialization(source_backend, list_of_index_groups)
