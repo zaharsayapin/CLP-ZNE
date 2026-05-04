@@ -210,6 +210,81 @@ def get_error_matrix(circuit, layout_cycles, backend, num_params=1, therm_noise_
     X = np.array(X_list) # Shape (len(layout_cycles), n_features)
     return X
 
+def vanilla_permutation_pased_zne(circuit, observables, layout_cycles, backend, num_perms=2, num_params=1,
+                                         therm_noise_multiplier=1, is_fully_connected=False, seed=42):
+    """
+    ZNE Mitigation using Cyclic Layout Permutations.
+    
+    Args:
+        num_params: 1 (Total 2Q) to 6 (Full breakdown).
+    """
+
+    rng = np.random.default_rng(seed)
+
+    n_qubits = circuit.num_qubits
+    
+    # 1. Prepare Layouts and Transpile
+    if is_fully_connected:
+        layouts_for_transpilation = []
+        chosen_cycle_indxs = rng.choice(len(layout_cycles), size=num_perms, replace=True)
+        for i in chosen_cycle_indxs:
+            chosen_layout_cycle = layout_cycles[i]
+            layouts_for_transpilation.append(rng.permutation(chosen_layout_cycle).tolist())
+    else:
+        cyclically_permuted_layouts = []
+        for cycle in layout_cycles:
+            cyclically_permuted_layouts.extend(cyclic_permutations(cycle))
+            cyclically_permuted_layouts.extend(cyclic_permutations(cycle[::-1]))
+        indxs = rng.choice(len(cyclically_permuted_layouts), size=num_perms, replace=False).tolist()
+        layouts_for_transpilation = [cyclically_permuted_layouts[i] for i in indxs]
+    
+    transpiled_circs = transpile_to_layouts(circuit, layouts_for_transpilation, backend.target)
+
+    print(transpiled_circs[0].count_ops())
+    
+    # Build noise model
+    noise_model = noise_model_from_backend(
+        backend,
+        add_readout=False,
+        add_gate_errors= True,
+        thermal_relaxation= True,
+        therm_error_multiplier=therm_noise_multiplier,
+        warnings= False,
+    )
+
+    # 2. Build Feature Matrix X
+    print("Calculating error profiles...")
+    profiles = [calculate_circuit_error_profile(backend, c, noise_model, therm_noise_multiplier) for c in transpiled_circs]
+    
+    X_list = []
+    for p in profiles:
+        X_list.append(p.get_features(num_params))
+    
+    X = np.array(X_list) # Shape (len(layout_cycles), n_features)
+    X_with_intercept = np.column_stack([np.ones(X.shape[0]), X])
+
+    # 3. Run Noisy Simulations
+    print("Running simulations...")
+    evals_noisy = compute_evals(
+        transpiled_circs, 
+        layouts=np.array(layouts_for_transpilation)[:, :n_qubits],
+        observables=observables, 
+        noise_model=noise_model
+    )
+    
+    # 4. Perform Multi-Parameter Regression
+    evals_mitigated = []
+    for obs_idx in range(len(observables)):
+        # Average noisy results across permutations
+        y = evals_noisy[obs_idx]
+        
+        coeffs, _, _, _ = np.linalg.lstsq(X_with_intercept, y, rcond=None)
+        
+        # The first coefficient is the intercept (noise -> 0 limit)
+        evals_mitigated.append(coeffs[0])
+        
+    return evals_mitigated, evals_noisy, X
+
 def clp_zne_mitigate_1d_topology_circuit(circuit, observables, layout_cycles, backend, num_params=1,
                                          therm_noise_multiplier=1):
     """
@@ -282,7 +357,68 @@ def reshape(data, rows, cols):
         raise ValueError("Total elements must match the new shape.")
     return [data[i * cols : (i + 1) * cols] for i in range(rows)]
 
-def clp_zne_mitigate_general_topology_circuit(circuit, observables, layout_cycles, backend, therm_noise_multiplier=1):
+
+#############################################
+
+def _filter_circuit_by_connection_type(circuit, cycle, connection_type):
+    """
+    Helper: Return a new circuit containing only CZ gates that match the given connection_type.
+    
+    Args:
+        circuit: Input QuantumCircuit
+        cycle: Layout cycle list for neighbor distance calculation
+        connection_type: Target connection type (minimal neighbor distance)
+        qubit_map: Optional mapping from circuit qubits to logical indices (for transpiled circuits)
+    
+    Returns:
+        QuantumCircuit with filtered gates
+    """
+    from qiskit import QuantumCircuit
+    
+    # Reuse the distance logic from compute_error_sum
+    def minimal_number_of_neighbours_between(arr, val1, val2):
+        if val1 not in arr or val2 not in arr or val1 == val2:
+            return None
+        idx1, idx2 = arr.index(val1), arr.index(val2)
+        n = len(arr)
+        return min(abs(idx1 - idx2), n - abs(idx1 - idx2)) - 1
+    
+    filtered = QuantumCircuit(circuit.num_qubits)
+    
+    for inst in circuit.data:
+        op = inst.operation
+        if op is None or op.name != 'cz':
+            continue
+        
+        qubits = tuple(circuit.find_bit(q)[0] for q in inst.qubits)
+        
+        # Check connection type constraint
+        dist = minimal_number_of_neighbours_between(cycle, *qubits)
+        if dist == connection_type:
+            filtered.append(op, inst.qubits)
+    
+    return filtered
+
+
+def clp_zne_mitigate_general_topology_circuit(circuit, observables, layout_cycles, backend, num_params=1,
+                                         therm_noise_multiplier=1):
+    """
+    ZNE Mitigation using Cyclic Layout Permutations for general topology with multiparameter extrapolation.
+    
+    Args:
+        circuit: Quantum circuit to mitigate.
+        observables: List of observables to measure.
+        layout_cycles: List of cyclic layout permutations.
+        backend: Backend to use for simulation/transpilation.
+        num_params: Number of error parameters per connection_type (1-3).
+                   1: [total2], 2: [d2, therm2], 3: [d2, t1_2, tp_2]
+        therm_noise_multiplier: Multiplier for thermal noise parameters.
+    
+    Returns:
+        evals_mitigated: List of mitigated expectation values.
+        evals_noisy: List of noisy expectation values.
+        X: Feature matrix used for regression, shape (len(layout_cycles), num_connection_types * num_params).
+    """
     num_qubits = circuit.num_qubits
     num_connection_types = num_qubits // 2
     target = backend.target
@@ -291,53 +427,82 @@ def clp_zne_mitigate_general_topology_circuit(circuit, observables, layout_cycle
     noise_model = noise_model_from_backend(
         backend,
         add_readout=False,
-        add_gate_errors= True,
-        thermal_relaxation= True,
+        add_gate_errors=True,
+        thermal_relaxation=True,
         therm_error_multiplier=therm_noise_multiplier,
+        warnings=False,
     )
 
     # Generate cyclic layout permutations (CLP)
     cyclically_permuted_layouts = []
     for cycle in layout_cycles:
         cyclically_permuted_layouts.extend(cyclic_permutations(cycle))
-
-    # Create passmanagers for transpiling
-    transpiled_circuits = transpile_to_layouts(circuit, cyclically_permuted_layouts, target,
-                                                add_measurements=False, dynamical_decoupling=False)
-    transpiled_circuits_reshaped = reshape(transpiled_circuits, len(layout_cycles), num_qubits)
     
-    # Compute error sums
-    error_mtx = np.zeros((len(layout_cycles), num_connection_types))
+    transpiled_circuits = transpile_to_layouts(
+        circuit, cyclically_permuted_layouts, target,
+        add_measurements=False, dynamical_decoupling=False
+    )
+    transpiled_reshaped = reshape(transpiled_circuits, len(layout_cycles), num_qubits)
+    
+    # Build multiparameter feature matrix
+    print("Calculating multiparameter error profiles per connection type...")
+    dummy_profile = ErrorProfile()
+    n_features_per_conn = len(dummy_profile.get_features(num_params))
+    total_features = num_connection_types * n_features_per_conn
+    
+    if len(cyclically_permuted_layouts) < total_features + 1:
+        warnings.warn(
+            f"Number of cyclically permuted layouts ({len(cyclically_permuted_layouts)}) may be insufficient "
+            f"for stable regression with {total_features} features + intercept. "
+            f"Consider reducing num_params or increasing layout_cycles."
+        )
+    
+    X_list = []
     for cycle_idx, cycle in enumerate(layout_cycles):
-        for connection_type in range(num_connection_types):
-            errors = [compute_error_sum(noise_model, tcirc, cycle, connection_type) for tcirc in transpiled_circuits_reshaped[cycle_idx]]
-            average_error = np.mean(errors)
-            error_mtx[cycle_idx, connection_type] = average_error
-    print(error_mtx)
-    
-    # Run with noise
-    print("Running density matrix simulations")
-    evals_noisy = compute_evals(transpiled_circuits, layouts=np.array(cyclically_permuted_layouts)[:, :num_qubits],
-                                    observables=observables, noise_model=noise_model)
-    # Iterate over observables
-    error_sums = []
-    evals_mitigated = []
-    for i, observable in enumerate(observables):
-        # Perform averaging
-        X = error_mtx
-        y_data = evals_noisy[i]
-        y = y_data.reshape((len(layout_cycles), -1)).mean(axis=1).reshape((len(layout_cycles), 1))
-
-        X_with_intercept = np.column_stack([np.ones(X.shape[0]), X])
-
-        coeffs = X_with_intercept.T @ np.linalg.inv(X_with_intercept @ X_with_intercept.T) @ y
+        cycle_feature_vector = []
+        for conn_type in range(num_connection_types):
+            # Filter each transpiled circuit to gates matching this connection_type,
+            # then use calculate_circuit_error_profile
+            profiles = []
+            for tcirc_idx, tcirc in enumerate(transpiled_reshaped[cycle_idx]):
+                filtered_circ = _filter_circuit_by_connection_type(tcirc, cycle, conn_type)
+                if len(filtered_circ.data) > 0:  # Only compute if there are matching gates
+                    profile = calculate_circuit_error_profile(
+                        backend, filtered_circ, noise_model, therm_noise_multiplier
+                    )
+                    profiles.append(profile)
+                else:
+                    profiles.append(ErrorProfile())  # Empty profile if no matching gates
+            
+            # Extract and average features across permutations
+            features = np.array([p.get_features(num_params) for p in profiles])
+            avg_features = np.mean(features, axis=0)
+            cycle_feature_vector.extend(avg_features.tolist())
         
-        eval_mitigated = coeffs[0, 0]
+        X_list.append(cycle_feature_vector)
+    
+    X = np.array(X_list)
+    X_with_intercept = np.column_stack([np.ones(X.shape[0]), X])
 
-        evals_mitigated.append(eval_mitigated)
-        error_sums.append(X)
+    # Run noisy simulations (reuse compute_evals)
+    print("Running density matrix simulations...")
+    evals_noisy = compute_evals(
+        transpiled_circuits, 
+        layouts=np.array(cyclically_permuted_layouts)[:, :num_qubits],
+        observables=observables,
+        noise_model=noise_model
+    )
+    
+    # Multi-parameter regression for each observable
+    evals_mitigated = []
+    for obs_idx in range(len(observables)):
+        y_data = evals_noisy[obs_idx]
+        y = y_data.reshape((len(layout_cycles), -1)).mean(axis=1)
+        coeffs, _, _, _ = np.linalg.lstsq(X_with_intercept, y, rcond=None)
+        evals_mitigated.append(coeffs[0])
+        
+    return evals_mitigated, evals_noisy, X
 
-    return evals_mitigated, evals_noisy, error_sums
 
 def zne_mitigate(circuit, observables, layout, backend, therm_noise_multiplier=1, folding_method='gate'):
     """
