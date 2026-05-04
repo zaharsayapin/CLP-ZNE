@@ -178,6 +178,14 @@ def compute_error_sum(noise_model, circuit, cycle, connection_type):
     return error_sum
 
 def get_error_matrix(circuit, layout_cycles, backend, num_params=1, therm_noise_multiplier=1):
+    noise_model = noise_model_from_backend(
+        backend,
+        add_readout=False,
+        add_gate_errors= True,
+        thermal_relaxation= True,
+        therm_error_multiplier=therm_noise_multiplier,
+        warnings= False,
+    )
     # 1. Prepare Layouts and Transpile
     cyclically_permuted_layouts = []
     for cycle in layout_cycles:
@@ -187,7 +195,7 @@ def get_error_matrix(circuit, layout_cycles, backend, num_params=1, therm_noise_
     
     # 2. Build Feature Matrix X
     print("Calculating error profiles...")
-    profiles = [calculate_circuit_error_profile(backend, c, therm_noise_multiplier) for c in transpiled_circs]
+    profiles = [calculate_circuit_error_profile(backend, c, noise_model, therm_noise_multiplier) for c in transpiled_circs]
     
     # Group profiles by layout groups to match the averaging in CLP
     group_size = len(cyclically_permuted_layouts) // len(layout_cycles)
